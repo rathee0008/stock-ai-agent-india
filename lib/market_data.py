@@ -112,6 +112,16 @@ def get_history(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.Da
     return df
 
 
+def get_history_range(ticker: str, start, end, interval: str = "1d") -> pd.DataFrame:
+    """Fetch history for an explicit start/end date range (used by the chart's custom
+    date-range picker, as an alternative to the preset `period` options)."""
+    resolved = resolve_ticker(ticker)
+    df = yf.Ticker(resolved).history(start=start, end=end, interval=interval)
+    if df.empty:
+        raise ValueError(f"No price history found for '{ticker}' ({resolved}) in that date range")
+    return df
+
+
 def get_fundamentals(ticker: str) -> dict:
     resolved = resolve_ticker(ticker)
     info = yf.Ticker(resolved).info
@@ -140,9 +150,55 @@ def get_news(ticker: str, limit: int = 5) -> list[dict]:
     return out
 
 
+def _parabolic_sar(high: pd.Series, low: pd.Series, close: pd.Series,
+                    af_step: float = 0.02, af_max: float = 0.2) -> pd.Series:
+    """Standard iterative Parabolic SAR (Wilder)."""
+    n = len(close)
+    psar = close.copy().astype(float)
+    if n == 0:
+        return psar
+    bull = True
+    af = af_step
+    ep = low.iloc[0]
+    hp = high.iloc[0]
+    lp = low.iloc[0]
+    psar.iloc[0] = close.iloc[0]
+    for i in range(1, n):
+        prev = psar.iloc[i - 1]
+        val = prev + af * (ep - prev)
+        reverse = False
+        if bull:
+            if low.iloc[i] < val:
+                bull, reverse, val = False, True, hp
+                af, ep = af_step, low.iloc[i]
+        else:
+            if high.iloc[i] > val:
+                bull, reverse, val = True, True, lp
+                af, ep = af_step, high.iloc[i]
+        if not reverse:
+            if bull:
+                if high.iloc[i] > ep:
+                    ep = high.iloc[i]
+                    af = min(af + af_step, af_max)
+                if i >= 2:
+                    val = min(val, low.iloc[i - 1], low.iloc[i - 2])
+            else:
+                if low.iloc[i] < ep:
+                    ep = low.iloc[i]
+                    af = min(af + af_step, af_max)
+                if i >= 2:
+                    val = max(val, high.iloc[i - 1], high.iloc[i - 2])
+        psar.iloc[i] = val
+        if bull:
+            lp = low.iloc[i]
+        else:
+            hp = high.iloc[i]
+    return psar
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    close = out["Close"]
+    close, high, low = out["Close"], out["High"], out["Low"]
 
     out["SMA_20"] = close.rolling(20).mean()
     out["SMA_50"] = close.rolling(50).mean()
@@ -162,6 +218,40 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     std = close.rolling(20).std()
     out["BB_upper"] = mid + 2 * std
     out["BB_lower"] = mid - 2 * std
+
+    # --- ATR (14) -----------------------------------------------------------
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    out["ATR_14"] = tr.rolling(14).mean()
+
+    # --- VWAP (cumulative over the loaded window) ----------------------------
+    typical_price = (high + low + close) / 3
+    cum_vol = out["Volume"].cumsum()
+    out["VWAP"] = (typical_price * out["Volume"]).cumsum() / cum_vol.replace(0, np.nan)
+
+    # --- Stochastic RSI (%K smoothed 3, %D smoothed 3) -----------------------
+    rsi_min = out["RSI_14"].rolling(14).min()
+    rsi_max = out["RSI_14"].rolling(14).max()
+    stoch = (out["RSI_14"] - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
+    out["STOCHRSI_K"] = (stoch * 100).rolling(3).mean()
+    out["STOCHRSI_D"] = out["STOCHRSI_K"].rolling(3).mean()
+
+    # --- Parabolic SAR -------------------------------------------------------
+    out["PSAR"] = _parabolic_sar(high, low, close)
+
+    # --- Ichimoku Cloud -------------------------------------------------------
+    conv = (high.rolling(9).max() + low.rolling(9).min()) / 2
+    base = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    out["ICHI_TENKAN"] = conv
+    out["ICHI_KIJUN"] = base
+    out["ICHI_SPAN_A"] = ((conv + base) / 2).shift(26)
+    span_b_src = (high.rolling(52).max() + low.rolling(52).min()) / 2
+    out["ICHI_SPAN_B"] = span_b_src.shift(26)
+    out["ICHI_CHIKOU"] = close.shift(-26)
 
     return out
 
